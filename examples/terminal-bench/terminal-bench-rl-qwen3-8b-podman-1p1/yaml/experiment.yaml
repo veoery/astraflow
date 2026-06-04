@@ -1,20 +1,29 @@
 # ============================================================================
-# Experiment config — AstraFlow service + Trainer + Harbor RL
-# Experiment: astraflow-code / terminal-bench-rl-qwen3-14b-podman-test
+# Experiment config — AstraFlow service + Trainer + Harbor RL (1+1 GPU)
+# Experiment: astraflow-code / terminal-bench-rl-qwen3-8b-podman-1p1
 #
-# Training dataset: SkyRL Harbor dataset layout, defaulting to the prepared
-# open-thoughts/CodeContests tasks under ./data-data/harbor/CodeContests.
+# Single-GPU-inference + single-GPU-trainer recipe for the RaaS OpenAI gateway
+# path: Harbor/Terminus-2 talks to RaaS (not SGLang directly), and the
+# token-level training trajectory is reconstructed server-side by the gateway
+# trajectory ledger (no harness rollout_details). Small batch sizes — intended
+# for end-to-end testing.
+#
+# NOTE: 8B single-GPU full fine-tuning is memory-heavy (optimizer states +
+# activations). Use a large-memory GPU (e.g. H200/B200); lower
+# actor.mb_spec.max_tokens_per_mb if you hit OOM.
+#
+# Training dataset: SkyRL Harbor dataset layout (CodeContests by default).
 # Training workflow: terminal_bench_harbor_rl through Harbor + Terminus-2.
-# Eval dataset: LiveCodeBench v6 only.
+# Eval dataset: LiveCodeBench v6.
 # ============================================================================
 
 experiment:
   experiment_name: astraflow-code
-  trial_name: terminal-bench-rl-qwen3-14b-podman-test
+  trial_name: terminal-bench-rl-qwen3-8b-podman-1p1
   fileroot: ./data-experiments/${experiment.experiment_name}/${experiment.trial_name}
 
-  model_path: "Qwen/Qwen3-14B"
-  tokenizer_path: "Qwen/Qwen3-14B"
+  model_path: "Qwen/Qwen3-8B"
+  tokenizer_path: "Qwen/Qwen3-8B"
   seed: 1
   dtype: bfloat16
   weight_transfer_mode: tcp
@@ -23,22 +32,22 @@ experiment:
 cluster:
   name_resolve:
     type: nfs
-    nfs_record_root: ./data-experiments/astraflow-code/terminal-bench-rl-qwen3-14b-podman-test/name_resolve
+    nfs_record_root: ./data-experiments/astraflow-code/terminal-bench-rl-qwen3-8b-podman-1p1/name_resolve
 
 raas:
   models:
     model0:
       backend: sglang
       gconfig:
-        n_samples: 8
+        n_samples: 4
         temperature: 1.0
-        max_new_tokens: 8192
+        max_new_tokens: 4096
         min_new_tokens: 0
   delta_full_sync_interval: 10
 
 dataflow:
   host: "0.0.0.0"
-  port: 8005
+  port: 8051
   dump_dir: ./data-experiments/${experiment.experiment_name}/${experiment.trial_name}/rollout_dumps
 
   buffer:
@@ -67,10 +76,10 @@ dataflow:
       - "--environment-import-path"
       - "examples.terminal-bench.harbor_podman_env:PodmanEnvironment"
     agent_name: "terminus-2"
-    model_name: "openai/Qwen/Qwen3-14B"
-    jobs_dir: ./data-experiments/astraflow-code/terminal-bench-rl-qwen3-14b-podman-test/harbor_jobs
+    model_name: "openai/Qwen/Qwen3-8B"
+    jobs_dir: ./data-experiments/astraflow-code/terminal-bench-rl-qwen3-8b-podman-1p1/harbor_jobs
     timeout: 7200.0
-    max_parallel_jobs: 16
+    max_parallel_jobs: 4
     agent_kwargs:
       temperature: 1.0
       max_turns: 1
@@ -97,17 +106,17 @@ dataflow:
       eval_workflow: code_eval
 
 trainer_base:
-  total_train_steps: 1200
-  train_batch_size: 32
-  n_samples: 8
+  total_train_steps: 200
+  train_batch_size: 4
+  n_samples: 4
   engine:
     backend: fsdp
-    data_parallel_size: 2
+    data_parallel_size: 1
 
   actor:
     gradient_checkpointing: true
     mb_spec:
-      max_tokens_per_mb: 22000
+      max_tokens_per_mb: 16000
     optimizer:
       type: adam
       lr: 3e-6
@@ -130,7 +139,7 @@ trainer_base:
 
   ref:
     mb_spec:
-      max_tokens_per_mb: 22000
+      max_tokens_per_mb: 16000
 
   recover:
     mode: auto
@@ -143,7 +152,7 @@ trainer_base:
     wandb:
       mode: online
       id_suffix: "uid"
-      tags: ["m2po", "code", "harbor-rl", "skyrl-codecontests", "terminus-2", "lcb-v6-eval", "qwen3-14b", "tcp", "delta", "b200", "podman"]
+      tags: ["m2po", "code", "harbor-rl", "gateway", "skyrl-codecontests", "terminus-2", "lcb-v6-eval", "qwen3-8b", "tcp", "delta", "podman", "1p1"]
 
 trainer_model0:
   model_id: model0
