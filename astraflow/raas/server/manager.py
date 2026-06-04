@@ -5,7 +5,10 @@ import logging as _stdlib_logging
 import os
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from typing import Any
 
@@ -14,6 +17,7 @@ from astraflow.raas.api.cli_args import InferenceEngineConfig
 from astraflow.raas.engine.sglang_remote import SGLangEngine
 from astraflow.raas.engine.vllm_remote import VLLMEngine
 from astraflow.raas.platforms import current_platform
+from astraflow.raas.server.trajectory_ledger import TrajectoryLedger
 from astraflow.raas.utils import logging
 from astraflow.raas.utils.network import find_free_ports, gethostip
 from astraflow.core.workflow.api.engine_api import EngineGroup
@@ -21,6 +25,36 @@ from astraflow.core.workflow.registry import get_reward, get_workflow
 
 _base_logger = logging.getLogger(__name__)
 logger = _base_logger  # replaced with adapter after engine_id is known
+
+
+class RolloutContext:
+    """Per-episode handle exposed to ``arun_episode`` via ``current_rollout``.
+
+    Lets a workflow open an OpenAI-gateway episode (and obtain the RaaS-served
+    ``api_base`` to hand an external harness), then pull the reconstructed
+    trajectory afterwards — without changing the workflow interface.
+    """
+
+    def __init__(self, manager: "RaaS3Manager", *, eval: bool = False):
+        self._manager = manager
+        self.eval = eval
+
+    def self_base_url(self) -> str:
+        return self._manager.self_base_url()
+
+    def open_episode(self, model_id: str | None = None) -> tuple[str, str]:
+        return self._manager.open_episode(model_id)
+
+    def get_trajectory(self, episode_id: str):
+        return self._manager.get_trajectory(episode_id)
+
+    def close_episode(self, episode_id: str) -> None:
+        self._manager.close_episode(episode_id)
+
+
+# Set by submit()/eval_submit() around arun_episode; read by gateway-aware
+# workflows. Unset outside a managed rollout (callers must handle LookupError).
+current_rollout: ContextVar[RolloutContext] = ContextVar("current_rollout")
 
 
 class RaaS3Manager:
@@ -66,6 +100,16 @@ class RaaS3Manager:
         self._running: asyncio.Event | None = None
         self._semaphore: asyncio.Semaphore | None = None
         self._max_concurrency: int = 0
+
+        # OpenAI gateway admission control — a SEPARATE semaphore from the
+        # rollout/eval semaphores (a Harbor episode holds the eval semaphore
+        # while its subprocess issues /v1 calls, so sharing would deadlock).
+        # Created lazily on the event loop in ``proxy_slot``.
+        self._proxy_semaphore: asyncio.Semaphore | None = None
+        self._max_proxy_concurrency: int = 0
+
+        # Per-episode token ledger for bit-exact multi-turn reconstruction.
+        self._ledger = TrajectoryLedger()
 
         # Training tasks
         self._running_tasks: dict[int, asyncio.Task] = {}
@@ -197,6 +241,97 @@ class RaaS3Manager:
             self._running.set()
         if self._load_poll_lock is None:
             self._load_poll_lock = asyncio.Lock()
+
+    # ------------------------------------------------------------------
+    # OpenAI gateway support (see claude-doc/OPENAI_GATEWAY_PLAN.md)
+    # ------------------------------------------------------------------
+
+    @asynccontextmanager
+    async def proxy_slot(self):
+        """Admission control for OpenAI-gateway (/v1) requests.
+
+        Uses a dedicated semaphore (never the rollout/eval one — see field
+        comment). Per-token weight-update pause is handled inside
+        ``agenerate`` via ``_paused``; this only bounds admitted requests.
+        """
+        self._ensure_async_state()
+        if self._proxy_semaphore is None:
+            bound = self._max_proxy_concurrency or self._max_concurrency or 256
+            self._proxy_semaphore = asyncio.Semaphore(max(1, int(bound)))
+        async with self._proxy_semaphore:
+            yield
+
+    def pick_engine(self, model_id: str | None):
+        """Resolve ``(engine, tokenizer, base_gconfig)`` for an OpenAI request.
+
+        Multi-model HF-name -> engine resolution is Phase 4; for now an unknown
+        or absent ``model`` falls back to the default engine.
+        """
+        if self._status != "ready":
+            raise RuntimeError(f"RaaS not ready (status={self._status}).")
+        if model_id and model_id in self._engines:
+            engine = self._engines[model_id]
+            tokenizer = self._tokenizers.get(model_id) or self._tokenizer
+            base = self._gconfigs.get(model_id) or self._gconfig
+        else:
+            engine = self._engine
+            tokenizer = self._tokenizer
+            base = self._gconfig
+        if engine is None:
+            raise KeyError(f"No engine available for model {model_id!r}.")
+        if tokenizer is None:
+            raise RuntimeError("No tokenizer loaded; set tokenizer_path in config.")
+        if base is None:
+            raise RuntimeError("No gconfig available.")
+        return engine, tokenizer, base
+
+    @staticmethod
+    def build_gconfig(base, tokenizer, body: dict[str, Any]):
+        """Map OpenAI sampling params onto a ``GenerationHyperparameters``."""
+        g = base.new_with_stop_and_pad_token_ids(tokenizer)
+        overrides: dict[str, Any] = {"n_samples": 1}
+        temp = body.get("temperature")
+        if temp is not None:
+            overrides["temperature"] = float(temp)
+            overrides["greedy"] = float(temp) == 0.0
+        if body.get("top_p") is not None:
+            overrides["top_p"] = float(body["top_p"])
+        max_nt = body.get("max_completion_tokens", body.get("max_tokens"))
+        if max_nt is not None:
+            overrides["max_new_tokens"] = int(max_nt)
+        if body.get("frequency_penalty") is not None:
+            overrides["frequency_penalty"] = float(body["frequency_penalty"])
+        stop = body.get("stop")
+        if stop is not None:
+            overrides["stop"] = [stop] if isinstance(stop, str) else list(stop)
+        return g.new(**overrides)
+
+    def served_model_names(self) -> list[str]:
+        names = list(self._engines.keys())
+        return names or (["default"] if self._engine is not None else [])
+
+    def default_model_name(self) -> str:
+        names = self.served_model_names()
+        return names[0] if names else "default"
+
+    # -- episode lifecycle (OpenAI gateway trajectory ledger) --------------
+
+    def self_base_url(self) -> str:
+        """Base URL of this RaaS instance (harness runs on the same host)."""
+        port = self._service_port or 19090
+        return f"http://127.0.0.1:{port}"
+
+    def open_episode(self, model_id: str | None = None) -> tuple[str, str]:
+        """Open a ledger episode; return ``(episode_id, api_base)``."""
+        episode_id = uuid.uuid4().hex
+        self._ledger.open(episode_id, model_id)
+        return episode_id, f"{self.self_base_url()}/ep/{episode_id}/v1"
+
+    def get_trajectory(self, episode_id: str):
+        return self._ledger.get_trajectory(episode_id)
+
+    def close_episode(self, episode_id: str) -> None:
+        self._ledger.close(episode_id)
 
     # ------------------------------------------------------------------
     # Bootstrap
@@ -768,9 +903,13 @@ class RaaS3Manager:
 
         async def _run():
             await self._running.wait()  # blocks during pause
-            async with self._semaphore:  # concurrency limit
-                async with engine_or_group.managed_session():
-                    result = await workflow.arun_episode(engine_or_group, data)
+            ctx_token = current_rollout.set(RolloutContext(self, eval=False))
+            try:
+                async with self._semaphore:  # concurrency limit
+                    async with engine_or_group.managed_session():
+                        result = await workflow.arun_episode(engine_or_group, data)
+            finally:
+                current_rollout.reset(ctx_token)
             # Auto-propagate prompt-level metadata into the result so it
             # survives the pull on the AstraFlow side. Workflows that
             # already populate these keys are respected (no overwrite).
@@ -1601,9 +1740,13 @@ class RaaS3Manager:
         )
 
         async def _run():
-            async with self._eval_semaphore:  # cap concurrent eval prefills
-                async with eval_engine_or_group.managed_session():
-                    return await workflow.arun_episode(eval_engine_or_group, data)
+            ctx_token = current_rollout.set(RolloutContext(self, eval=True))
+            try:
+                async with self._eval_semaphore:  # cap concurrent eval prefills
+                    async with eval_engine_or_group.managed_session():
+                        return await workflow.arun_episode(eval_engine_or_group, data)
+            finally:
+                current_rollout.reset(ctx_token)
 
         task = asyncio.create_task(_run())
         task.add_done_callback(lambda t: self._on_eval_task_done(task_id, t))

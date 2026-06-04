@@ -56,6 +56,11 @@ def build_app(manager: RaaS3Manager | None = None) -> FastAPI:
     app = FastAPI()
     app.state.manager = manager or RaaS3Manager()
 
+    # OpenAI-compatible gateway (/v1/*, /ep/{id}/v1/*) — see openai_gateway.py
+    from .openai_gateway import register_openai_routes
+
+    register_openai_routes(app)
+
     # ------------------------------------------------------------------
     # Status
     # ------------------------------------------------------------------
