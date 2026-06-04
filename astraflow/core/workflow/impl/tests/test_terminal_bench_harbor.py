@@ -10,7 +10,6 @@ from astraflow.core.workflow.impl.terminal_bench_harbor import (
     TerminalBenchHarborWorkflow,
     _collect_harbor_rewards,
     _extract_reward_from_result,
-    _harbor_result_to_training_sequence,
     _load_harbor_trial_result,
 )
 
@@ -90,48 +89,11 @@ def test_harbor_task_path_dataset_loads_skyrl_layout(tmp_path, monkeypatch):
     assert dataset[0]["task_name"] == "task-a"
 
 
-def test_harbor_result_to_training_sequence_uses_rollout_details():
-    result = {
-        "agent_result": {
-            "rollout_details": [
-                {
-                    "prompt_token_ids": [[10, 11], [10, 11, 12, 20, 30]],
-                    "completion_token_ids": [[12, 20], [31]],
-                    "logprobs": [[-0.1, -0.2], [-0.3]],
-                }
-            ]
-        },
-        "verifier_result": {"rewards": {"reward": 0.5}},
-    }
-
-    seq = _harbor_result_to_training_sequence(result, reward=0.5, version=7)
-
-    assert seq["input_ids"].tolist() == [[10, 11, 12, 20, 30, 31]]
-    assert seq["loss_mask"].tolist() == [[0, 0, 1, 1, 0, 1]]
-    assert seq["logprobs"].tolist()[0] == pytest.approx(
-        [0.0, 0.0, -0.1, -0.2, 0.0, -0.3]
-    )
-    assert seq["versions"].tolist() == [[-1, -1, 7, 7, -1, 7]]
-    assert seq["attention_mask"].tolist() == [[True, True, True, True, True, True]]
-    assert seq["rewards"].tolist() == [pytest.approx(0.5)]
-
-
-def test_harbor_result_to_training_sequence_requires_rollout_details():
-    with pytest.raises(ValueError, match="collect_rollout_details=true"):
-        _harbor_result_to_training_sequence(
-            {"agent_result": {"rollout_details": []}},
-            reward=0.0,
-            version=1,
-        )
-
-
 def test_build_command_supports_conda_wrapped_harbor(tmp_path):
-    class DummyEngine:
-        addresses = ["127.0.0.1:12345"]
-
     workflow = TerminalBenchHarborWorkflow(
         gconfig=object(),
         tokenizer=None,
+        api_base="http://127.0.0.1:12345/v1",
         harbor_command=[
             "conda",
             "run",
@@ -142,7 +104,7 @@ def test_build_command_supports_conda_wrapped_harbor(tmp_path):
         ],
     )
 
-    cmd = workflow._build_command(DummyEngine(), "build-pmars", tmp_path)
+    cmd = workflow._build_command("build-pmars", tmp_path)
 
     assert cmd[:7] == [
         "conda",
@@ -160,18 +122,15 @@ def test_build_command_supports_conda_wrapped_harbor(tmp_path):
 
 
 def test_build_command_supports_harbor_task_path(tmp_path):
-    class DummyEngine:
-        addresses = ["127.0.0.1:12345"]
-
     task_dir = tmp_path / "task-a"
     task_dir.mkdir()
     workflow = TerminalBenchHarborWorkflow(
         gconfig=object(),
         tokenizer=None,
+        api_base="http://127.0.0.1:12345/v1",
     )
 
     cmd = workflow._build_command(
-        DummyEngine(),
         "task-a",
         tmp_path / "job",
         task_path=task_dir,
@@ -183,54 +142,39 @@ def test_build_command_supports_harbor_task_path(tmp_path):
     assert "task-a" not in cmd
 
 
-def test_build_command_round_robins_inferred_api_bases(tmp_path):
-    class DummyEngine:
-        addresses = ["127.0.0.1:12345", "127.0.0.1:12346"]
-
+def test_build_command_uses_configured_api_base(tmp_path):
     workflow = TerminalBenchHarborWorkflow(
         gconfig=object(),
         tokenizer=None,
+        api_base="http://127.0.0.1:20001/v1",
     )
 
-    cmd0 = workflow._build_command(DummyEngine(), "task-a", tmp_path / "a")
-    cmd1 = workflow._build_command(DummyEngine(), "task-b", tmp_path / "b")
-    cmd2 = workflow._build_command(DummyEngine(), "task-c", tmp_path / "c")
-
-    assert "api_base=http://127.0.0.1:12345/v1" in cmd0
-    assert "api_base=http://127.0.0.1:12346/v1" in cmd1
-    assert "api_base=http://127.0.0.1:12345/v1" in cmd2
-
-
-def test_build_command_round_robins_configured_api_bases(tmp_path):
-    class DummyEngine:
-        addresses = ["127.0.0.1:12345"]
-
-    workflow = TerminalBenchHarborWorkflow(
-        gconfig=object(),
-        tokenizer=None,
-        api_base=[
-            "http://127.0.0.1:20001/v1",
-            "http://127.0.0.1:20002/v1",
-        ],
-    )
-
-    cmd0 = workflow._build_command(DummyEngine(), "task-a", tmp_path / "a")
-    cmd1 = workflow._build_command(DummyEngine(), "task-b", tmp_path / "b")
+    cmd0 = workflow._build_command("task-a", tmp_path / "a")
+    cmd1 = workflow._build_command("task-b", tmp_path / "b")
 
     assert "api_base=http://127.0.0.1:20001/v1" in cmd0
-    assert "api_base=http://127.0.0.1:20002/v1" in cmd1
+    assert "api_base=http://127.0.0.1:20001/v1" in cmd1
 
 
-def test_rl_workflow_enables_rollout_details_and_disables_summarize(tmp_path):
-    class DummyEngine:
-        addresses = ["127.0.0.1:12345"]
+def test_resolve_api_base_errors_without_config_or_raas(tmp_path):
+    # No configured api_base and no RaaS rollout context → clear error
+    # (the legacy "infer from SGLang addresses" fallback was removed).
+    workflow = TerminalBenchHarborWorkflow(gconfig=object(), tokenizer=None)
+    with pytest.raises(RuntimeError, match="No model API base"):
+        workflow._build_command("task-a", tmp_path)
 
+
+def test_rl_workflow_disables_summarize_and_drops_rollout_details(tmp_path):
     workflow = TerminalBenchHarborRLWorkflow(
         gconfig=object(),
         tokenizer=None,
+        api_base="http://127.0.0.1:12345/v1",
     )
 
-    cmd = workflow._build_command(DummyEngine(), "task-a", tmp_path)
+    cmd = workflow._build_command("task-a", tmp_path)
 
-    assert "collect_rollout_details=true" in cmd
+    # Summarization stays off (it would break the ledger's linear-append
+    # assumption). collect_rollout_details is no longer forced: token-level
+    # training data now comes from the RaaS gateway ledger, not the harness.
     assert "enable_summarize=false" in cmd
+    assert not any(c.startswith("collect_rollout_details=") for c in cmd)

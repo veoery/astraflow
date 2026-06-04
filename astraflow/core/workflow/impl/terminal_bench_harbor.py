@@ -13,7 +13,7 @@ from typing import Any
 import torch
 
 from astraflow.core.workflow.api.cli_args import GenerationHyperparameters
-from astraflow.core.workflow.api.engine_api import EngineGroup, InferenceEngine
+from astraflow.core.workflow.api.engine_api import InferenceEngine
 from astraflow.core.workflow.api.workflow_api import RolloutWorkflow
 from astraflow.core.workflow.registry import register_workflow
 from astraflow.core.workflow.utils import logging, stats_tracker
@@ -92,125 +92,22 @@ def _load_harbor_trial_result(job_root: Path) -> tuple[Path, dict[str, Any]]:
     return result_path, result
 
 
-def _extract_rollout_details(result: dict[str, Any]) -> list[dict[str, Any]]:
-    agent_result = result.get("agent_result")
-    if isinstance(agent_result, dict):
-        rollout_details = agent_result.get("rollout_details")
-        if isinstance(rollout_details, list):
-            return [
-                detail
-                for detail in rollout_details
-                if isinstance(detail, dict)
-            ]
-    return []
-
-
-def _as_turn_token_lists(value: Any, field_name: str) -> list[list[int]]:
-    if not isinstance(value, list):
-        raise ValueError(f"Harbor rollout detail missing list field {field_name!r}.")
-    turns: list[list[int]] = []
-    for turn_idx, turn in enumerate(value):
-        if not isinstance(turn, list):
-            raise ValueError(
-                f"Harbor rollout detail field {field_name!r} turn {turn_idx} "
-                f"is {type(turn).__name__}, expected list."
-            )
-        turns.append([int(token) for token in turn])
-    return turns
-
-
-def _as_turn_float_lists(value: Any, field_name: str) -> list[list[float]]:
-    if not isinstance(value, list):
-        raise ValueError(f"Harbor rollout detail missing list field {field_name!r}.")
-    turns: list[list[float]] = []
-    for turn_idx, turn in enumerate(value):
-        if not isinstance(turn, list):
-            raise ValueError(
-                f"Harbor rollout detail field {field_name!r} turn {turn_idx} "
-                f"is {type(turn).__name__}, expected list."
-            )
-        turns.append([float(logprob) for logprob in turn])
-    return turns
-
-
-def _prompt_suffix_for_accumulated_sequence(
-    prompt_token_ids: list[int],
-    accumulated_sequence: list[int],
-) -> list[int]:
-    if not accumulated_sequence:
-        return prompt_token_ids
-    if prompt_token_ids[: len(accumulated_sequence)] == accumulated_sequence:
-        return prompt_token_ids[len(accumulated_sequence) :]
-    return prompt_token_ids
-
-
-def _harbor_result_to_training_sequence(
-    result: dict[str, Any],
-    reward: float,
-    version: int,
-    rollout_detail_index: int = 0,
+def _harbor_traj_to_training_sequence(
+    traj: dict[str, Any], reward: float
 ) -> dict[str, torch.Tensor]:
-    rollout_details = _extract_rollout_details(result)
-    if not rollout_details:
-        raise ValueError(
-            "Harbor result has no rollout_details. Set Terminus-2 "
-            "agent_kwarg collect_rollout_details=true for RL training."
-        )
-    if rollout_detail_index >= len(rollout_details):
-        raise ValueError(
-            f"Harbor result has {len(rollout_details)} rollout detail(s), "
-            f"but rollout_detail_index={rollout_detail_index}."
-        )
+    """Convert a RaaS ledger trajectory into RL training tensors.
 
-    detail = rollout_details[rollout_detail_index]
-    prompt_turns = _as_turn_token_lists(
-        detail.get("prompt_token_ids"), "prompt_token_ids"
-    )
-    completion_turns = _as_turn_token_lists(
-        detail.get("completion_token_ids"), "completion_token_ids"
-    )
-    logprob_turns = _as_turn_float_lists(detail.get("logprobs"), "logprobs")
-
-    n_turns = len(completion_turns)
-    if len(prompt_turns) != n_turns or len(logprob_turns) != n_turns:
-        raise ValueError(
-            "Harbor rollout detail has inconsistent turn counts: "
-            f"prompt={len(prompt_turns)}, completion={len(completion_turns)}, "
-            f"logprobs={len(logprob_turns)}."
-        )
-
-    seq: list[int] = []
-    logprobs: list[float] = []
-    loss_mask: list[int] = []
-    versions: list[int] = []
-    n_completion_tokens = 0
-
-    for turn_idx, (prompt_tokens, completion_tokens, turn_logprobs) in enumerate(
-        zip(prompt_turns, completion_turns, logprob_turns)
-    ):
-        if len(completion_tokens) != len(turn_logprobs):
-            raise ValueError(
-                f"Harbor rollout detail turn {turn_idx} has "
-                f"{len(completion_tokens)} completion token(s) but "
-                f"{len(turn_logprobs)} logprob(s)."
-            )
-        prompt_delta = _prompt_suffix_for_accumulated_sequence(prompt_tokens, seq)
-        seq += prompt_delta + completion_tokens
-        logprobs += [0.0] * len(prompt_delta) + turn_logprobs
-        loss_mask += [0] * len(prompt_delta) + [1] * len(completion_tokens)
-        versions += [-1] * len(prompt_delta) + [version] * len(completion_tokens)
-        n_completion_tokens += len(completion_tokens)
-
-    if not seq:
-        raise ValueError("Harbor rollout detail produced an empty token sequence.")
-    if n_completion_tokens == 0:
-        raise ValueError("Harbor rollout detail has no trainable completion tokens.")
-
+    ``traj`` carries the bit-exact, token-in-token-out sequence reconstructed by
+    the gateway ledger: ``input_ids`` (prompt + every turn's completion),
+    ``loss_mask`` (1 on generated tokens), ``logprobs`` and per-turn
+    ``versions``. No re-tokenization or stitching is needed here.
+    """
+    seq = list(traj["input_ids"])
     res = {
         "input_ids": torch.tensor(seq, dtype=torch.int32),
-        "loss_mask": torch.tensor(loss_mask, dtype=torch.int32),
-        "logprobs": torch.tensor(logprobs, dtype=torch.float32),
-        "versions": torch.tensor(versions, dtype=torch.int32),
+        "loss_mask": torch.tensor(traj["loss_mask"], dtype=torch.int32),
+        "logprobs": torch.tensor(traj["logprobs"], dtype=torch.float32),
+        "versions": torch.tensor(traj["versions"], dtype=torch.int32),
         "attention_mask": torch.ones(len(seq), dtype=torch.bool),
         "rewards": torch.tensor(float(reward), dtype=torch.float32),
     }
@@ -227,49 +124,6 @@ def _tail(text: str, limit: int = 4000) -> str:
     return text[-limit:] if len(text) > limit else text
 
 
-def _engine_addresses(engine: InferenceEngine) -> list[str]:
-    engines: list[Any]
-    if isinstance(engine, EngineGroup):
-        engines = [engine[key] for key in engine.keys()]
-    else:
-        engines = [engine]
-
-    addresses: list[str] = []
-    seen: set[str] = set()
-    for one_engine in engines:
-        candidates = [
-            one_engine,
-            getattr(one_engine, "_engine", None),
-            getattr(getattr(one_engine, "default", None), "_engine", None),
-        ]
-        for candidate in candidates:
-            for address in getattr(candidate, "addresses", None) or []:
-                address = str(address)
-                if address not in seen:
-                    seen.add(address)
-                    addresses.append(address)
-    return addresses
-
-
-def _append_api_base_suffix(api_base: str, suffix: str) -> str:
-    base = (
-        api_base
-        if api_base.startswith(("http://", "https://"))
-        else f"http://{api_base}"
-    )
-    return f"{base.rstrip('/')}{suffix}" if suffix else base.rstrip("/")
-
-
-def _as_api_base_list(api_base: str | list[str] | tuple[str, ...] | None) -> list[str]:
-    if api_base is None:
-        return []
-    if isinstance(api_base, str):
-        values = [api_base]
-    else:
-        values = list(api_base)
-    return [str(value).strip() for value in values if str(value).strip()]
-
-
 @register_workflow("terminal_bench_harbor")
 class TerminalBenchHarborWorkflow(RolloutWorkflow):
     """Run Terminal-Bench through Harbor and return AstraFlow eval rewards."""
@@ -284,8 +138,7 @@ class TerminalBenchHarborWorkflow(RolloutWorkflow):
         harbor_command: list[str] | None = None,
         agent_name: str = "terminus-2",
         model_name: str = "openai/local-model",
-        api_base: str | list[str] | tuple[str, ...] | None = None,
-        api_base_suffix: str = "/v1",
+        api_base: str | None = None,
         api_key: str = "EMPTY",
         api_key_env: str = "OPENAI_API_KEY",
         environment: str | None = None,
@@ -311,7 +164,6 @@ class TerminalBenchHarborWorkflow(RolloutWorkflow):
         self.agent_name = agent_name
         self.model_name = model_name
         self.api_base = api_base
-        self.api_base_suffix = api_base_suffix
         self.api_key = api_key
         self.api_key_env = api_key_env
         self.environment = environment
@@ -326,7 +178,6 @@ class TerminalBenchHarborWorkflow(RolloutWorkflow):
         self.agent_kwargs = dict(agent_kwargs or {})
         self.agent_env = dict(agent_env or {})
         self.extra_args = list(extra_args or [])
-        self._api_base_next_idx = 0
 
     async def arun_episode(
         self,
@@ -343,7 +194,8 @@ class TerminalBenchHarborWorkflow(RolloutWorkflow):
                 "dataset repeat/k for pass@k.",
                 configured_samples,
             )
-        results = [await self._run_one_harbor_trial(engine, data)]
+        del engine  # generation is routed through the RaaS gateway, not this handle
+        results = [await self._run_one_harbor_trial(data)]
         rewards = torch.tensor([r["reward"] for r in results], dtype=torch.float32)
         eval_correct = torch.tensor(
             [1.0 if r["reward"] > 0.0 else 0.0 for r in results],
@@ -366,16 +218,18 @@ class TerminalBenchHarborWorkflow(RolloutWorkflow):
 
     async def _run_one_harbor_trial(
         self,
-        engine: InferenceEngine,
         data: dict[str, Any],
+        api_base_override: str | None = None,
     ) -> dict[str, Any]:
         async with self._semaphore:
-            return await self._run_one_harbor_trial_unlocked(engine, data)
+            return await self._run_one_harbor_trial_unlocked(
+                data, api_base_override=api_base_override
+            )
 
     async def _run_one_harbor_trial_unlocked(
         self,
-        engine: InferenceEngine,
         data: dict[str, Any],
+        api_base_override: str | None = None,
     ) -> dict[str, Any]:
         task_path = data.get("task_path")
         if task_path is None and isinstance(data.get("prompt"), str):
@@ -392,7 +246,10 @@ class TerminalBenchHarborWorkflow(RolloutWorkflow):
         run_jobs_dir = root / f"{index}-{run_id}"
         run_jobs_dir.mkdir(parents=True, exist_ok=True)
 
-        cmd = self._build_command(engine, task_name, run_jobs_dir, task_path=task_path)
+        cmd = self._build_command(
+            task_name, run_jobs_dir, task_path=task_path,
+            api_base=api_base_override,
+        )
         env = os.environ.copy()
         if self.api_key_env and self.api_key_env not in env:
             env[self.api_key_env] = self.api_key
@@ -467,10 +324,10 @@ class TerminalBenchHarborWorkflow(RolloutWorkflow):
 
     def _build_command(
         self,
-        engine: InferenceEngine,
         task_name: Any,
         run_jobs_dir: Path,
         task_path: Any | None = None,
+        api_base: str | None = None,
     ) -> list[str]:
         cmd = list(self.harbor_command or [self.harbor_binary]) + ["run"]
         if task_path:
@@ -491,12 +348,8 @@ class TerminalBenchHarborWorkflow(RolloutWorkflow):
             cmd.extend(["--env", self.environment])
 
         agent_kwargs = dict(self.agent_kwargs)
-        api_base = self._allocate_api_base(engine)
-        if not api_base:
-            raise RuntimeError(
-                "TerminalBenchHarborWorkflow could not find a model API base "
-                "URL from configured `api_base` or the RaaS eval engine."
-            )
+        if api_base is None:
+            api_base = self._resolve_api_base()
         agent_kwargs.setdefault("api_base", api_base)
         for key, value in agent_kwargs.items():
             formatted_value = _format_agent_kwarg_value(value)
@@ -505,40 +358,51 @@ class TerminalBenchHarborWorkflow(RolloutWorkflow):
         cmd.extend(self.extra_args)
         return cmd
 
-    def _configured_api_bases(self) -> list[str]:
-        return _as_api_base_list(self.api_base)
+    @staticmethod
+    def _rollout_ctx():
+        """Return the current RaaS RolloutContext, or None outside a RaaS run.
 
-    def _infer_api_base(self, engine: InferenceEngine) -> list[str]:
-        suffix = self.api_base_suffix or ""
-        return [
-            _append_api_base_suffix(address, suffix)
-            for address in _engine_addresses(engine)
-        ]
-
-    def _available_api_bases(self, engine: InferenceEngine) -> list[str]:
-        return self._configured_api_bases() or self._infer_api_base(engine)
-
-    def _allocate_api_base(self, engine: InferenceEngine) -> str | None:
-        api_bases = self._available_api_bases(engine)
-        if not api_bases:
+        Lazy import avoids a core.workflow -> raas import cycle at load time.
+        """
+        try:
+            from astraflow.raas.server.manager import current_rollout
+        except Exception:
             return None
-        api_base = api_bases[self._api_base_next_idx % len(api_bases)]
-        self._api_base_next_idx += 1
-        return api_base
+        try:
+            return current_rollout.get()
+        except LookupError:
+            return None
+
+    def _resolve_api_base(self) -> str:
+        """Resolve the model API base for the non-episode / eval path.
+
+        Precedence: an explicit ``api_base`` from config, else the local RaaS
+        OpenAI gateway (the single RaaS instance running this workflow — it
+        load-balances across its own SGLang servers internally). Harbor traffic
+        always goes through RaaS; the legacy "talk directly to SGLang addresses"
+        path has been removed.
+        """
+        if self.api_base:
+            return str(self.api_base).strip()
+        ctx = self._rollout_ctx()
+        if ctx is not None:
+            return ctx.self_base_url().rstrip("/") + "/v1"
+        raise RuntimeError(
+            "No model API base available. Run this workflow under the RaaS "
+            "server (so Harbor uses the RaaS OpenAI gateway) or set `api_base`."
+        )
 
 
 @register_workflow("terminal_bench_harbor_rl")
 class TerminalBenchHarborRLWorkflow(TerminalBenchHarborWorkflow):
     """Run Terminal-Bench through Harbor and return AstraFlow RL tensors."""
 
-    def __init__(
-        self,
-        *args,
-        rollout_detail_index: int = 0,
-        **kwargs,
-    ):
+    def __init__(self, *args, **kwargs):
         agent_kwargs = dict(kwargs.pop("agent_kwargs", {}) or {})
-        agent_kwargs.setdefault("collect_rollout_details", True)
+        # Token-level training data now comes from the RaaS gateway ledger, not
+        # the harness — so we no longer force collect_rollout_details. We still
+        # disable summarization, which would break the linear-append assumption
+        # the ledger relies on for bit-exact reconstruction.
         agent_kwargs.setdefault("enable_summarize", False)
         kwargs["agent_kwargs"] = agent_kwargs
         kwargs.setdefault("rollout_stat_scope", "rollout")
@@ -555,17 +419,17 @@ class TerminalBenchHarborRLWorkflow(TerminalBenchHarborWorkflow):
         kwargs["n_concurrent_trials"] = 1
 
         super().__init__(*args, **kwargs)
-        self.rollout_detail_index = int(rollout_detail_index)
 
     async def arun_episode(
         self,
         engine: InferenceEngine,
         data: dict[str, Any],
     ) -> dict[str, Any]:
+        del engine  # generation is routed through the RaaS gateway, not this handle
         n_samples = max(1, int(getattr(self.gconfig, "n_samples", 1)))
         sample_results = await asyncio.gather(
             *[
-                self._run_one_harbor_training_trial(engine, data)
+                self._run_one_harbor_training_trial(data)
                 for _ in range(n_samples)
             ]
         )
@@ -586,37 +450,49 @@ class TerminalBenchHarborRLWorkflow(TerminalBenchHarborWorkflow):
 
     async def _run_one_harbor_training_trial(
         self,
-        engine: InferenceEngine,
         data: dict[str, Any],
     ) -> dict[str, torch.Tensor]:
-        harbor_summary = await self._run_one_harbor_trial(engine, data)
-        job_root = Path(harbor_summary["jobs_dir"])
-        result_path, result = _load_harbor_trial_result(job_root)
-        if not _extract_rollout_details(result):
+        # Token-level trajectory is reconstructed server-side by the RaaS
+        # OpenAI gateway ledger; we open an episode, point Harbor at its
+        # per-episode api_base, then read back the bit-exact trajectory.
+        ctx = self._rollout_ctx()
+        if ctx is None:
             raise RuntimeError(
-                "Could not find Harbor rollout_details in trial result. "
-                "Check that agent_kwargs.collect_rollout_details=true and the "
-                "OpenAI-compatible backend returns token IDs/logprobs. "
-                f"Result: {result_path}"
+                "terminal_bench_harbor_rl requires the RaaS OpenAI gateway "
+                "(no rollout context found). Run the workflow under the RaaS "
+                "server so /v1 traffic is captured into the trajectory ledger."
             )
-
-        reward = _extract_reward_from_result(result)
-        if reward is None:
-            reward = float(harbor_summary["reward"])
+        episode_id, api_base = ctx.open_episode()
         try:
-            version = int(engine.get_version())
-        except Exception:
-            logger.exception("Could not read engine version; using version=0.")
-            version = 0
-
-        try:
-            return _harbor_result_to_training_sequence(
-                result,
-                reward=float(reward),
-                version=version,
-                rollout_detail_index=self.rollout_detail_index,
+            harbor_summary = await self._run_one_harbor_trial(
+                data, api_base_override=api_base
             )
-        except ValueError as exc:
-            raise RuntimeError(
-                f"Could not convert Harbor result to RL tensors: {result_path}"
-            ) from exc
+            # Reward from Harbor's verifier (the environment), correlated by
+            # episode. Token trajectory from the RaaS ledger.
+            job_root = Path(harbor_summary["jobs_dir"])
+            result_path, result = _load_harbor_trial_result(job_root)
+            reward = _extract_reward_from_result(result)
+            if reward is None:
+                reward = float(harbor_summary["reward"])
+
+            traj = ctx.get_trajectory(episode_id)
+            if not traj or not traj.get("input_ids"):
+                raise RuntimeError(
+                    f"No RaaS trajectory captured for episode {episode_id}. Did "
+                    f"Harbor reach the gateway api_base ({api_base})? "
+                    f"result: {result_path}"
+                )
+            if traj.get("degraded"):
+                logger.warning(
+                    "Episode %s trajectory is degraded (non-linear history); "
+                    "training on a best-effort reconstruction.",
+                    episode_id,
+                )
+            if sum(traj["loss_mask"]) == 0:
+                raise RuntimeError(
+                    f"Harbor trajectory for episode {episode_id} has no "
+                    f"trainable tokens. result: {result_path}"
+                )
+            return _harbor_traj_to_training_sequence(traj, float(reward))
+        finally:
+            ctx.close_episode(episode_id)
